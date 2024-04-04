@@ -12,7 +12,7 @@ from sklearn.metrics import mean_squared_error
 from math import radians, cos, sin, atan2, degrees
 
 
-def is_nearby(point_a, point_b, threshold=15):
+def is_nearby(point_a, point_b, threshold=1):
     """判断两个点是否接近。"""
     distance = geodesic(point_a, point_b).kilometers
     return distance <= threshold
@@ -31,24 +31,48 @@ def calculate_bearing(pointA, pointB):
     bearing = (bearing + 360) % 360
     return bearing
 
-def is_towards_destination_with_curve(df, current_index, closest_to_current_point, threshold=10):
+def is_towards_destination_with(df, current_index, closest_to_current_point, threshold=90):
     """考虑曲线轨迹，判断点是否朝向预期终点。"""
     current_position = (df.loc[current_index, "LAT"], df.loc[current_index, "LON"])
-    # 前一个点和后一个点，用于估计切线方向
-    if current_index > 0 and current_index < len(df) - 1:
-        prev_position = (df.loc[current_index - 1, "LAT"], df.loc[current_index - 1, "LON"])
-        next_position = (df.loc[current_index + 1, "LAT"], df.loc[current_index + 1, "LON"])
-        tangent_bearing = calculate_bearing(prev_position, next_position)
+    # closest_to_current_point的后一个点，用于估计切线方向
+    if closest_to_current_point > 0 and closest_to_current_point < len(df) - 1:
+        # prev_position = (df.loc[closest_to_current_point - 1, "LAT"], df.loc[closest_to_current_point - 1, "LON"])
+        next_position = (df.loc[closest_to_current_point + 1, "LAT"], df.loc[closest_to_current_point + 1, "LON"])
+        tangent_bearing = calculate_bearing(closest_to_current_point, next_position)
         destination_bearing = calculate_bearing(current_position, closest_to_current_point)
         # 比较方向
         bearing_diff = abs(tangent_bearing - destination_bearing)
-        # 确保在0-180度内比较
+        # 确保在0-180度内比较（abs应该不会吧）
         if bearing_diff > 180:
             bearing_diff = 360 - bearing_diff
         return bearing_diff <= threshold
     else:
         # 如果没有足够的点来估计切线方向，简化处理（或返回False，或使用其他逻辑）
         return False
+
+def is_towards_destination_with_curve(df, current_position, closest_to_current_index, threshold=90):
+    """考虑曲线轨迹，判断点是否朝向预期终点。"""
+    # 在循环中检查直到找到满足条件的点或达到数据集末尾
+    while closest_to_current_index < len(df) - 1:
+        closest_to_current_position = (df.loc[closest_to_current_index, "LAT"], df.loc[closest_to_current_index, "LON"])
+        next_position = (df.loc[closest_to_current_index + 1, "LAT"], df.loc[closest_to_current_index + 1, "LON"])
+        tangent_bearing = calculate_bearing(closest_to_current_position, next_position)
+        test_bearing = calculate_bearing(current_position, closest_to_current_position)
+
+        bearing_diff = abs(tangent_bearing - test_bearing)
+        # 确保在0-180度内比较
+        if bearing_diff > 180:
+            bearing_diff = 360 - bearing_diff
+
+        # 如果bearing_diff小于或等于阈值，返回True，否则继续循环
+        if bearing_diff <= threshold:
+            return True, closest_to_current_index
+
+        # 移动到下一个点
+        closest_to_current_index += 1
+
+    # 如果循环结束没有找到满足条件的点
+    return False, None
 
 
 def load_history_routes(filepath):
@@ -65,145 +89,98 @@ def tensor_to_dataframe(tensor, columns):
     return df
 
 
-if __name__ == "__main__":
-    # 加载航线数据
-    filePath = "data/history_routes_for_each_ship.txt"
-    routeFile = load_history_routes(filePath)
-
-    # 参数设置
-    maxLen = 325
-    getLen = 25
-    inputLen = 24
-    shipNum = sum(len(value) >= maxLen for value in routeFile.values())
-
-    # 初始化预测数据Tensor
-    predictShipData = torch.zeros([shipNum, inputLen, 11])  # 注意：增加shipId,起点和终点的经纬
-
-    # 构建预测数据集
-    shipId = 0
-    for key, value in routeFile.items():  # 使用key获取MMSI
-        if len(value) >= maxLen:
-            for startIndex in range(0, len(value), (inputLen - 1) * getLen):
-                endIndex = min(startIndex + (inputLen - 1) * getLen, len(value))
-                if endIndex - startIndex < (inputLen - 1) * getLen:
-                    break
-                # 获取起点和终点的经纬度
-                start_lat = value[startIndex]["LAT"]
-                start_lon = value[startIndex]["LON"]
-                destination_lat = value[endIndex]["LAT"]
-                destination_lon = value[endIndex]["LON"]
-
-                for positionId in range(inputLen):
-                    dataPointIndex = startIndex + positionId * getLen
-                    eachData = value[dataPointIndex]
-
-                    if shipId < shipNum:
-                        predictShipData[shipId][positionId] = torch.tensor([
-                            shipId,  # 存储shipId作为航线的唯一标识
-                            eachData["MMSI"], eachData["LAT"], eachData["LON"],
-                            eachData["SOG"], eachData["COG"], eachData["Heading"],
-                            start_lat, start_lon,  # 添加起始经纬度
-                            destination_lat, destination_lon
-                        ])
-                shipId += 1
-
-    # 转换为DataFrame
-    columns = ["ShipId", "MMSI", "LAT", "LON", "SOG", "COG", "Heading", "Start_LAT", "Start_LON","Destination_LAT", "Destination_LON"]
-    df = tensor_to_dataframe(predictShipData, columns)
-
-    # 设置随机数种子 TODO:替换成真实数据
-    np.random.seed(0)
-    size = df.shape[0]
-    # 生成进油口流量的假数据并添加到df
-    df['IFR'] = np.random.uniform(40, 100, size=(size))
-    # 生成出油口流量的假数据并添加到df
-    df['OFR'] = np.random.uniform(80, 450, size=(size))
-    # 生成吃水信息的假数据并添加到df
-    df['draft'] = np.random.uniform(10, 100, size=(size))
-    # 新增航次表的信息
-    df['start'] =  np.random.uniform()
-
-    # 打印更新后的df以确认
-    print(df.head())
-
-    # 起点、当前位置和预期终点
-    start_position = (29.8350,-91.98000)
-    current_position = (29.77000, -91.78000)
-    expected_destination = (29.6664, -91.39036)
+import pandas as pd
 
 
-
+def find_routes_pass_by(df, start_position, expected_destination):
     # 筛选同时经过起点和预期终点附近的航线
-    df['IsNearStart'] = df.apply(lambda row: is_nearby((row["Start_LAT"], row["Start_LON"]), start_position), axis=1)
+    df['IsNearStart'] = df.apply(lambda row: is_nearby((row["LAT"], row["LON"]), start_position), axis=1)
     df['IsNearDestination'] = df.apply(
-        lambda row: is_nearby((row["Destination_LAT"], row["Destination_LON"]), expected_destination), axis=1)
+        lambda row: is_nearby((row["LAT"], row["LON"]), expected_destination), axis=1)
 
-    # 筛选同时满足两个条件的ShipId
-    nearby_ship_ids = df[df['IsNearStart'] & df['IsNearDestination']]['ShipId'].unique()
+    # 筛选出经过起点附近的船舶ID
+    near_start_ids = df[df['IsNearStart']]['ShipId'].unique()
+    # 筛选出经过目的地附近的船舶ID
+    near_destination_ids = df[df['IsNearDestination']]['ShipId'].unique()
+    # 找出同时满足两个条件的船舶ID
+    nearby_ship_ids = set(near_start_ids).intersection(near_destination_ids)
 
-    # 在这些航线中，选择与当前位置最短距离最小的航线
-    df['DistanceToCurrent'] = df.apply(lambda row: geodesic(current_position, (row["LAT"], row["LON"])).kilometers,
-                                       axis=1)
-    # 顺便计算一下到终点的确切距离
-    df['DistanceToDestination'] = df.apply(lambda row: geodesic(expected_destination, (row["LAT"], row["LON"])).kilometers,
-                                       axis=1)
-    min_distance = float('inf')
-    selected_ship_id = None
+    # 初始化一个空的DataFrame来收集所有选中的航线点
+    selected_paths = pd.DataFrame()
     for ship_id in nearby_ship_ids:
-        min_distance_ship = df[df['ShipId'] == ship_id]['DistanceToCurrent'].min()
-        if min_distance_ship < min_distance:
-            min_distance = min_distance_ship
-            selected_ship_id = ship_id
+        # 获取选中航线的所有点
+        selected_path = df[df['ShipId'] == ship_id] if ship_id is not None else pd.DataFrame()
+        # 将当前航线的点添加到selected_paths中
+        selected_paths = pd.concat([selected_paths, selected_path], ignore_index=True)
 
+    # 返回所有选中的航线点
+    return selected_paths
+
+
+# if __name__ == "__main__":
+def cal_time_oil_cost(df,start_position,expected_destination,current_position):
+    min_distance = float('inf')
+    min_distance_dest = float('inf')
+    selected_ship_id = None
+    closest_point_idx = None  # 用于记录最近点的索引
+    closest_to_dest_idx = None
+
+    for idx, row in df.iterrows():
+        # 计算当前行船舶位置到当前位置的距离
+        distance_to_current = geodesic(current_position, (row["LAT"], row["LON"])).kilometers
+        # 计算到终点的距离
+        distance_to_dest = geodesic(expected_destination, (row["LAT"], row["LON"])).kilometers
+
+        # 检查这个距离是否是目前遇到的最值
+        if distance_to_current < min_distance:
+            min_distance = distance_to_current
+            selected_ship_id = row['ShipId']
+            closest_point_idx = idx  # 更新最近点的索引
+        if distance_to_dest < min_distance_dest:
+            min_distance_dest = distance_to_dest
+            closest_to_dest_idx = idx  # 更新最近点的索引
     # 获取选中航线的所有点
     selected_path = df[df['ShipId'] == selected_ship_id] if selected_ship_id is not None else pd.DataFrame()
+    # TODO:添加价格预测 这里并不是很合适的位置
+    prices_array = np.load('data/pred.npy')
+    prices_array = prices_array[0, :, :]
+    # 重塑数组
+    reshaped_array = prices_array.reshape(-1, 8)
+    # 创建 DataFrame
+    prices_df = pd.DataFrame(reshaped_array, columns=[f"Prices_{i}" for i in range(1, 9)])
+    add_prices_df = pd.concat([selected_path.reset_index(drop=True), prices_df.reset_index(drop=True)], axis=1)
 
-    # 绘制地图和航线
+    if not selected_path.empty:
+        # Step 1: 找到离currentPosition最近的点
+        # 检查至currentPosition满足方向要求
+        is_toward,closest_to_current_idx = is_towards_destination_with_curve(df,current_position,closest_point_idx,90)
+        if not is_toward:# TODO:添加方向不同的错误提示
+            return None
+        # Step 2：找到离Destination最近的点
+        # 确保两个特定点的索引都有效
+        if closest_to_dest_idx and closest_to_current_idx:
+            # 确定两点之间的部分（注意处理索引可能颠倒的情况）
+            if closest_to_current_idx > closest_to_dest_idx:  # TODO:这里其实说明方向不一致，应该有错误处理
+                partial_path = df.loc[closest_to_dest_idx:closest_to_current_idx]
+            else:
+                partial_path = df.loc[closest_to_current_idx:closest_to_dest_idx]
+
+    # Step 3: 绘制地图和航线
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
     ax.add_feature(cfeature.LAND)
     ax.add_feature(cfeature.COASTLINE)
     ax.set_extent([-100, -80, 20, 40])
 
-    # 绘制所有历史航线
+    # 绘制所有经过起点和终点的历史航线
     for index, row in df.iterrows():
         plt.plot(row['LON'], row['LAT'], marker='o', color='blue', markersize=1, transform=ccrs.Geodetic())
 
-    if not selected_path.empty:
-        # Step 1: 找到离currentPosition最近的点
-        closest_to_current_idx = selected_path['DistanceToCurrent'].idxmin()
-        # 检查是否满足方向要求 TODO：更改成循环直到找到符合要求的
-        # 应用这个逻辑
-        # 注意：这里需要适当修改，因为is_towards_destination_with_curve设计为逐行处理，依赖于索引和数据框
-        closest_to_current_point = (df.loc[closest_to_current_idx, "LAT"], df.loc[closest_to_current_idx, "LON"])
-        df['IsTowards'] = False
-        for index, row in selected_path.iterrows(): #TODO:Debug:这个index和row都还是原来df的
-            df.loc[index, 'IsTowards'] = is_towards_destination_with_curve(df, index, closest_to_current_point,
-                                                                           threshold=90)
-        selected_path = selected_path[df['IsTowards'] == True]
-        # Step 2：找到离Destination最近的点
-        closest_to_dest_idx = selected_path['DistanceToDestination'].idxmin()
-        # # Step 2: 预期目的地附近的点已经通过IsNearby筛选过，这里直接使用
-        # near_destination_indices = selected_path[selected_path['IsNearDestination']].index.tolist()
-        # # 如果有多个符合条件的点，选择第一个作为示例
-        # near_destination_idx = near_destination_indices[0] if near_destination_indices else None
-        # 确保两个特定点的索引都有效
-        if closest_to_dest_idx and closest_to_current_idx:
-            # Step 3: 绘制选中的整条航线
-            # for index, row in selected_path.iterrows():
-            #     plt.plot(row['LON'], row['LAT'], marker='o', color='red', markersize=1, transform=ccrs.Geodetic())
+    # 绘制最后选择的部分
+    plt.plot(partial_path['LON'].to_numpy(), partial_path['LAT'].to_numpy(),
+             marker='o', color='red', markersize=1, transform=ccrs.Geodetic(), label='Highlighted Path')
 
-            # 确定两点之间的部分（注意处理索引可能颠倒的情况）
-            if closest_to_current_idx > closest_to_dest_idx:#TODO:这里其实说明方向不一直，应该有错误处理
-                partial_path = df.loc[closest_to_dest_idx:closest_to_current_idx]
-            else:
-                partial_path = df.loc[closest_to_current_idx:closest_to_dest_idx]
-
-            # 绘制这一部分
-            plt.plot(partial_path['LON'].to_numpy(), partial_path['LAT'].to_numpy(),
-                     marker='o', color='red', markersize=1, transform=ccrs.Geodetic(), label='Highlighted Path')
-
-    # 绘制起点同终点
+    # 绘制起点+终点
     plt.plot(current_position[1], current_position[0], marker='*', color='yellow', markersize=2,
              label='Current Position', transform=ccrs.Geodetic())
     plt.plot(expected_destination[1], expected_destination[0], marker='D', color='pink', markersize=2,
@@ -213,7 +190,12 @@ if __name__ == "__main__":
     plt.title('Ship Route Visualization')
     plt.show()
 
-    partial_path.to_csv('data/nearest_prediction.csv', index=False, encoding='utf-8-sig')
+    # partial_path.to_csv('data/nearest_prediction.csv', index=False, encoding='utf-8-sig')
+    if selected_path.empty or partial_path.empty:
+        return None
+
+
+
 
     ###############################燃油消耗的估算(简单线性规划)###################################################################
 
@@ -245,4 +227,7 @@ if __name__ == "__main__":
 
     ###############################最终输出(简单线性规划)###################################################################
     time = partial_path.shape[0] * 1 #TODO:替换成真正的行间距
-    print(f'final :Predicted Fuel Consumption Rate: {predicted_fuel_consumption_rate[0]}; time costing:',time)
+    price = add_prices_df.iloc[time,-1]
+    print(f'final :Predicted Fuel Consumption Rate: {predicted_fuel_consumption_rate[0]}; time costing:',time,'prices:',price)
+    #输出线路和油耗
+    return partial_path,predicted_fuel_consumption_rate,time,price
